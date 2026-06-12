@@ -1,0 +1,359 @@
+import vk_api
+from vk_api.longpoll import VkLongPoll, VkEventType
+from vk_api.keyboard import VkKeyboard, VkKeyboardColor
+import sqlite3
+from datetime import datetime
+
+TOKEN = "vk1.a.sfmfNIHZHxjkS-j5DvOy8gV0oLTiF9pNttapAcHMXZLC9pPjNi_6DkbREYPWr6cMoaIQ_BJYLw5zMgyPD303bP0eCF6fsadoVcS9lcG4882gn4xBn2tKrNfsJwcEkLGCQL1vSdQoe3kzNaGoNp65fjOjRkE5ssAW07dt-Hw4RLRGy7xe6jwz3h4JRzzo2Dr3pkaCdGsQr-eZ_y1FwD7uLA"
+
+conn = sqlite3.connect('recipes_full.db', check_same_thread=False)
+cursor = conn.cursor()
+
+def get_ingredient_id(ingredient_name):
+    cursor.execute('SELECT id FROM ingredients WHERE LOWER(name) = LOWER(?)', (ingredient_name.strip(),))
+    result = cursor.fetchone()
+    return result[0] if result else None
+
+def find_recipes(user_products_str):
+    products = [p.strip().lower() for p in user_products_str.split(',') if p.strip()]
+    
+    user_ingredient_ids = []
+    for product in products:
+        ing_id = get_ingredient_id(product)
+        if ing_id:
+            user_ingredient_ids.append(ing_id)
+    
+    if not user_ingredient_ids:
+        return []
+    
+    user_set = set(user_ingredient_ids)
+    
+    cursor.execute('''
+        SELECT DISTINCT r.id, d.name, r.instructions, 
+               p.calories, p.protein, p.fats, p.carbs, p.portion_size,
+               d.prep_time_minutes, dt.name
+        FROM recipes r
+        JOIN dishes d ON r.dish_id = d.id
+        JOIN portions p ON p.recipe_id = r.id
+        JOIN dish_types dt ON d.dish_type_id = dt.id
+    ''')
+    
+    all_recipes = cursor.fetchall()
+    found = []
+    
+    for recipe in all_recipes:
+        recipe_id = recipe[0]
+        cursor.execute('SELECT ingredient_id FROM recipe_ingredients WHERE recipe_id = ?', (recipe_id,))
+        recipe_ingredients = [row[0] for row in cursor.fetchall()]
+        
+        if set(recipe_ingredients).issubset(user_set):
+            found.append(recipe)
+    
+    return found
+
+def format_recipe(recipe, num, total):
+    recipe_id, name, instructions, calories, protein, fats, carbs, portion_size, prep_time, dish_type = recipe
+    
+    cursor.execute('''
+        SELECT i.name, ri.quantity, ri.unit 
+        FROM recipe_ingredients ri
+        JOIN ingredients i ON ri.ingredient_id = i.id
+        WHERE ri.recipe_id = ?
+    ''', (recipe_id,))
+    ingredients_list = cursor.fetchall()
+    
+    ingredients_text = "\n".join([f"   • {ing[0]}: {ing[1]} {ing[2]}" for ing in ingredients_list])
+    
+    return f"""🍽 {name.upper()} ({num}/{total})
+
+⏱️ Время: {prep_time} мин | 📋 {dish_type}
+
+📝 ИНГРЕДИЕНТЫ:
+{ingredients_text}
+
+👨‍🍳 ПРИГОТОВЛЕНИЕ:
+{instructions}
+
+📊 КБЖУ (на {portion_size} г):
+   🔥 {calories} ккал | 🥩 {protein} г | 🧈 {fats} г | 🍚 {carbs} г
+
+✅ Всё уже есть дома!"""
+
+def get_main_keyboard():
+    kb = VkKeyboard(one_time=False)
+    kb.add_button("🔍 Найти рецепт", color=VkKeyboardColor.POSITIVE)
+    kb.add_button("📋 Помощь", color=VkKeyboardColor.PRIMARY)
+    kb.add_line()
+    kb.add_button("ℹ️ О боте", color=VkKeyboardColor.SECONDARY)
+    return kb
+
+def get_recipe_keyboard():
+    kb = VkKeyboard(one_time=False)
+    kb.add_button("➡️ Другой рецепт", color=VkKeyboardColor.SECONDARY)
+    kb.add_line()
+    kb.add_button("🔍 Новый поиск", color=VkKeyboardColor.POSITIVE)
+    return kb
+
+user_cache = {}
+
+vk_session = vk_api.VkApi(token=TOKEN)
+vk = vk_session.get_api()
+longpoll = VkLongPoll(vk_session)
+
+print("=" * 50)
+print("🤖 БОТ ЗАПУЩЕН")
+print("=" * 50)
+print("Примеры запросов:")
+print("   молоко, овсяные хлопья, сахар")
+print("   яйца, молоко, масло сливочное")
+print("   гречка, куриное филе")
+print("=" * 50)
+
+for event in longpoll.listen():
+    if event.type == VkEventType.MESSAGE_NEW and event.to_me:
+        user_id = event.user_id
+        text = event.text.strip()
+        
+        print(f"\n📨 {datetime.now().strftime('%H:%M:%S')} | {user_id}: {text}")
+        
+        if text.lower() in ["начать", "start"]:
+            vk.messages.send(
+                user_id=user_id,
+                message="👨‍🍳 Привет! Напиши продукты через запятую.\n\nПример: молоко, овсяные хлопья, сахар",
+                random_id=0,
+                keyboard=get_main_keyboard().get_keyboard()
+            )
+        
+        elif text == "🔍 Найти рецепт":
+            kb = VkKeyboard(one_time=False)
+            kb.add_button("🏠 Главное меню", color=VkKeyboardColor.PRIMARY)
+            vk.messages.send(
+                user_id=user_id,
+                message="📝 Напиши продукты через запятую:\n\nПример: молоко, овсяные хлопья, сахар",
+                random_id=0,
+                keyboard=kb.get_keyboard()
+            )
+        
+        elif text == "🔍 Новый поиск":
+            user_cache.pop(user_id, None)
+            vk.messages.send(
+                user_id=user_id,
+                message="📝 Напиши новые продукты через запятую:",
+                random_id=0
+            )
+        
+        elif text == "🏠 Главное меню":
+            vk.messages.send(
+                user_id=user_id,
+                message="🏠 Главное меню",
+                random_id=0,
+                keyboard=get_main_keyboard().get_keyboard()
+            )
+        
+        elif text == "📋 Помощь":
+            vk.messages.send(
+                user_id=user_id,
+                message="""📖 ИНСТРУКЦИЯ
+
+1. Напиши продукты через запятую
+   Пример: молоко, овсяные хлопья, сахар
+
+2. Бот покажет рецепты из твоих продуктов
+
+3. Нажимай "Другой рецепт" для переключения
+
+В базе 30 рецептов!""",
+                random_id=0,
+                keyboard=get_main_keyboard().get_keyboard()
+            )
+        
+        elif text == "ℹ️ О боте":
+            cursor.execute('SELECT COUNT(*) FROM dishes')
+            count = cursor.fetchone()[0]
+            vk.messages.send(
+                user_id=user_id,
+                message=f"🤖 Бот-повар\n\nВерсия 2.0\n📊 {count} рецептов\n✅ Поиск без докупки\n👨‍💻 Курсовая работа",
+                random_id=0,
+                keyboard=get_main_keyboard().get_keyboard()
+            )
+        
+        elif text == "➡️ Другой рецепт":
+            if user_id in user_cache and user_cache[user_id].get('recipes'):
+                recipes = user_cache[user_id]['recipes']
+                idx = user_cache[user_id].get('index', 0)
+                idx = (idx + 1) % len(recipes)
+                user_cache[user_id]['index'] = idx
+                msg = format_recipe(recipes[idx], idx + 1, len(recipes))
+                vk.messages.send(
+                    user_id=user_id,
+                    message=msg,
+                    random_id=0,
+                    keyboard=get_recipe_keyboard().get_keyboard()
+                )
+            else:
+                vk.messages.send(
+                    user_id=user_id,
+                    message="❌ Сначала найди рецепты! Напиши продукты.",
+                    random_id=0,
+                    keyboard=get_main_keyboard().get_keyboard()
+                )
+        
+        elif ',' in text:
+            recipes = find_recipes(text)
+            
+            if not recipes:
+                vk.messages.send(
+                    user_id=user_id,
+                    message=f"😔 По запросу '{text}' ничего не найдено.\n\n💡 Попробуй:\n   молоко, овсяные хлопья, сахар\n   яйца, молоко, масло\n   гречка, куриное филе",
+                    random_id=0,
+                    keyboard=get_main_keyboard().get_keyboard()
+                )
+            else:
+                user_cache[user_id] = {'recipes': recipes, 'index': 0}
+                msg = format_recipe(recipes[0], 1, len(recipes))
+                vk.messages.send(
+                    user_id=user_id,
+                    message=f"🎉 Найдено {len(recipes)} рецептов!\n\n{msg}",
+                    random_id=0,
+                    keyboard=get_recipe_keyboard().get_keyboard()
+                )
+        
+        else:
+            vk.messages.send(
+                user_id=user_id,
+                message="❓ Напиши продукты через запятую.\n\nПример: молоко, овсяные хлопья, сахар",
+                random_id=0,
+                keyboard=get_main_keyboard().get_keyboard()
+            )
+import sqlite3
+
+conn = sqlite3.connect('recipes_full.db')
+cursor = conn.cursor()
+
+# Удаляем старые таблицы
+cursor.execute('DROP TABLE IF EXISTS recipe_ingredients')
+cursor.execute('DROP TABLE IF EXISTS portions')
+cursor.execute('DROP TABLE IF EXISTS recipes')
+cursor.execute('DROP TABLE IF EXISTS dishes')
+cursor.execute('DROP TABLE IF EXISTS users')
+cursor.execute('DROP TABLE IF EXISTS search_history')
+cursor.execute('DROP TABLE IF EXISTS ingredients')
+cursor.execute('DROP TABLE IF EXISTS categories')
+cursor.execute('DROP TABLE IF EXISTS dish_types')
+cursor.execute('DROP TABLE IF EXISTS cuisines')
+
+# Создаём таблицы
+cursor.execute('''
+CREATE TABLE categories (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT UNIQUE NOT NULL
+)
+''')
+
+cursor.execute('''
+CREATE TABLE dish_types (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT UNIQUE NOT NULL
+)
+''')
+
+cursor.execute('''
+CREATE TABLE cuisines (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT UNIQUE NOT NULL
+)
+''')
+
+cursor.execute('''
+CREATE TABLE ingredients (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT UNIQUE NOT NULL,
+    category_id INTEGER,
+    FOREIGN KEY (category_id) REFERENCES categories(id)
+)
+''')
+
+cursor.execute('''
+CREATE TABLE dishes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    dish_type_id INTEGER,
+    cuisine_id INTEGER,
+    prep_time_minutes INTEGER,
+    description TEXT,
+    FOREIGN KEY (dish_type_id) REFERENCES dish_types(id),
+    FOREIGN KEY (cuisine_id) REFERENCES cuisines(id)
+)
+''')
+
+cursor.execute('''
+CREATE TABLE recipes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    dish_id INTEGER UNIQUE NOT NULL,
+    instructions TEXT NOT NULL,
+    min_servings INTEGER DEFAULT 1,
+    max_servings INTEGER DEFAULT 4,
+    FOREIGN KEY (dish_id) REFERENCES dishes(id) ON DELETE CASCADE
+)
+''')
+
+cursor.execute('''
+CREATE TABLE portions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    recipe_id INTEGER NOT NULL,
+    portion_size INTEGER DEFAULT 100,
+    calories INTEGER,
+    protein REAL,
+    fats REAL,
+    carbs REAL,
+    FOREIGN KEY (recipe_id) REFERENCES recipes(id) ON DELETE CASCADE
+)
+''')
+
+cursor.execute('''
+CREATE TABLE recipe_ingredients (
+    recipe_id INTEGER NOT NULL,
+    ingredient_id INTEGER NOT NULL,
+    quantity REAL,
+    unit TEXT,
+    PRIMARY KEY (recipe_id, ingredient_id),
+    FOREIGN KEY (recipe_id) REFERENCES recipes(id) ON DELETE CASCADE,
+    FOREIGN KEY (ingredient_id) REFERENCES ingredients(id) ON DELETE CASCADE
+)
+''')
+
+cursor.execute('''
+CREATE TABLE users (
+    user_id INTEGER PRIMARY KEY,
+    first_name TEXT,
+    last_name TEXT,
+    registered_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    last_active DATETIME,
+    total_searches INTEGER DEFAULT 0,
+    total_recipe_views INTEGER DEFAULT 0
+)
+''')
+
+cursor.execute('''
+CREATE TABLE search_history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    search_time DATETIME DEFAULT CURRENT_TIMESTAMP,
+    query TEXT,
+    results_count INTEGER,
+    selected_recipe_id INTEGER,
+    FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE
+)
+''')
+
+conn.commit()
+print("✅ Структура базы данных создана!")
+
+# Проверка
+cursor.execute("SELECT name FROM sqlite_master WHERE type='table'")
+tables = cursor.fetchall()
+print("📋 Созданные таблицы:")
+for table in tables:
+    print(f"   - {table[0]}")
+
+conn.close()
