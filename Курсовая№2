@@ -1,0 +1,757 @@
+from flask import Flask, render_template, request, redirect, url_for, flash, Response
+from flask_login import LoginManager, login_user, logout_user, login_required, current_user
+from models import db, Book, Author, Publisher, Genre, PublicationType, CopyStatus, User, BookCopy, Reader, Loan
+from functools import wraps
+from datetime import date, timedelta
+import csv
+from io import StringIO
+
+app = Flask(__name__)
+app.config['SECRET_KEY'] = 'super-secret-key-change-me'
+app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///library.db'
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+db.init_app(app)
+
+login_manager = LoginManager()
+login_manager.init_app(app)
+login_manager.login_view = 'login'
+login_manager.login_message = 'Пожалуйста, войдите в систему.'
+
+@login_manager.user_loader
+def load_user(user_id):
+    return db.session.get(User, int(user_id))
+
+# ---------- Декоратор: только для админа ----------
+def admin_required(f):
+    @wraps(f)
+    @login_required
+    def decorated(*args, **kwargs):
+        if current_user.role != 'admin':
+            flash('Доступ только для администратора.', 'error')
+            return redirect(url_for('index'))
+        return f(*args, **kwargs)
+    return decorated
+
+# ---------- Главная страница: каталог + поиск + фильтр ----------
+@app.route('/')
+def index():
+    search = request.args.get('search', '').strip()
+    genre_id = request.args.get('genre', '')
+
+    query = Book.query
+
+    if search:
+        query = query.filter(Book.title.ilike(f'%{search}%'))
+
+    if genre_id:
+        query = query.filter(Book.genre_id == int(genre_id))
+
+    books = query.all()
+    genres = Genre.query.all()
+
+    return render_template('index.html', books=books, genres=genres,
+                           search=search, selected_genre=genre_id)
+
+# ---------- Регистрация ----------
+@app.route('/register', methods=['GET', 'POST'])
+def register():
+    if request.method == 'POST':
+        username = request.form.get('username', '').strip()
+        password = request.form.get('password', '')
+        password2 = request.form.get('password2', '')
+
+        errors = []
+        if not username:
+            errors.append('Введите имя пользователя.')
+        if len(password) < 4:
+            errors.append('Пароль должен содержать минимум 4 символа.')
+        if password != password2:
+            errors.append('Пароли не совпадают.')
+        if User.query.filter_by(username=username).first():
+            errors.append('Такое имя пользователя уже занято.')
+
+        if errors:
+            return render_template('register.html', errors=errors, username=username)
+
+        user = User(username=username, role='reader')
+        user.set_password(password)
+        db.session.add(user)
+        db.session.commit()
+        flash('Регистрация успешна! Теперь войдите.', 'success')
+        return redirect(url_for('login'))
+
+    return render_template('register.html')
+
+# ---------- Вход ----------
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    if request.method == 'POST':
+        username = request.form.get('username', '').strip()
+        password = request.form.get('password', '')
+
+        user = User.query.filter_by(username=username).first()
+        if user and user.check_password(password):
+            login_user(user)
+            flash('Вы вошли в систему.', 'success')
+            return redirect(url_for('index'))
+        else:
+            return render_template('login.html', error='Неверное имя пользователя или пароль.')
+
+    return render_template('login.html')
+
+# ---------- Выход ----------
+@app.route('/logout')
+@login_required
+def logout():
+    logout_user()
+    flash('Вы вышли из системы.', 'success')
+    return redirect(url_for('index'))
+
+# ---------- Добавление книги (только для авторизованных) ----------
+@app.route('/add_book', methods=['GET', 'POST'])
+@login_required
+def add_book():
+    genres = Genre.query.all()
+
+    if request.method == 'POST':
+        title = request.form.get('title', '').strip()
+        year = request.form.get('year')
+        isbn = request.form.get('isbn', '').strip()
+        location = request.form.get('location', '').strip()
+        genre_id = request.form.get('genre_id')
+
+        errors = []
+        if not title:
+            errors.append('Название книги обязательно.')
+        if not genre_id:
+            errors.append('Выберите жанр.')
+
+        if errors:
+            return render_template('add_book.html', errors=errors, genres=genres,
+                                   title=title, year=year, isbn=isbn, location=location)
+
+        pub_type = PublicationType.query.first()
+        publisher = Publisher.query.first()
+        if not pub_type or not publisher:
+            return render_template('add_book.html', genres=genres,
+                                   errors=['Справочники не заполнены. Обратитесь к администратору.'])
+
+        new_book = Book(
+            title=title,
+            year=int(year) if year else None,
+            isbn=isbn if isbn else None,
+            location=location if location else 'Не указано',
+            genre_id=int(genre_id),
+            type_id=pub_type.id,
+            publisher_id=publisher.id
+        )
+        db.session.add(new_book)
+        db.session.commit()
+        flash('Книга добавлена!', 'success')
+        return redirect(url_for('index'))
+
+    return render_template('add_book.html', genres=genres)
+
+# ---------- Админ-панель (главная) ----------
+@app.route('/admin')
+@admin_required
+def admin_panel():
+    stats = {
+        'books': Book.query.count(),
+        'genres': Genre.query.count(),
+        'users': User.query.count(),
+        'admins': User.query.filter_by(role='admin').count(),
+    }
+    all_books = Book.query.order_by(Book.title).all()
+    all_genres = Genre.query.order_by(Genre.name).all()
+    all_users = User.query.order_by(User.username).all()
+    all_admins = User.query.filter_by(role='admin').all()
+    return render_template('admin_panel.html',
+                           stats=stats,
+                           all_books=all_books,
+                           all_genres=all_genres,
+                           all_users=all_users,
+                           all_admins=all_admins)
+
+# ---------- Удаление книги (только админ) ----------
+@app.route('/admin/books/<int:book_id>/delete', methods=['POST'])
+@admin_required
+def delete_book(book_id):
+    book = Book.query.get_or_404(book_id)
+    db.session.delete(book)
+    db.session.commit()
+    flash(f'Книга «{book.title}» удалена.', 'success')
+    return redirect(url_for('admin_panel'))
+
+# ---------- Редактирование книги (только админ) ----------
+@app.route('/admin/books/<int:book_id>/edit', methods=['GET', 'POST'])
+@admin_required
+def edit_book(book_id):
+    book = Book.query.get_or_404(book_id)
+    genres = Genre.query.all()
+
+    if request.method == 'POST':
+        title = request.form.get('title', '').strip()
+        year = request.form.get('year')
+        isbn = request.form.get('isbn', '').strip()
+        location = request.form.get('location', '').strip()
+        genre_id = request.form.get('genre_id')
+
+        errors = []
+        if not title:
+            errors.append('Название книги обязательно.')
+        if not genre_id:
+            errors.append('Выберите жанр.')
+
+        if errors:
+            return render_template('edit_book.html', book=book, genres=genres, errors=errors)
+
+        book.title = title
+        book.year = int(year) if year else None
+        book.isbn = isbn if isbn else None
+        book.location = location if location else 'Не указано'
+        book.genre_id = int(genre_id)
+        db.session.commit()
+        flash('Книга обновлена.', 'success')
+        return redirect(url_for('admin_panel'))
+
+    return render_template('edit_book.html', book=book, genres=genres)
+
+# ---------- Управление пользователями ----------
+@app.route('/admin/users')
+@login_required
+def admin_users():
+    if current_user.role != 'admin':
+        flash('Доступ только для администратора.', 'error')
+        return redirect(url_for('index'))
+    users = User.query.all()
+    return render_template('admin_users.html', users=users)
+
+@app.route('/admin/users/<int:user_id>/role', methods=['POST'])
+@login_required
+def change_role(user_id):
+    if current_user.role != 'admin':
+        flash('Доступ только для администратора.', 'error')
+        return redirect(url_for('index'))
+    user = User.query.get_or_404(user_id)
+    new_role = request.form.get('role')
+    if new_role in ('reader', 'admin'):
+        user.role = new_role
+        db.session.commit()
+        flash('Роль изменена.', 'success')
+    return redirect(url_for('admin_users'))
+
+# ---------- Удаление пользователя (только админ) ----------
+@app.route('/admin/users/<int:user_id>/delete', methods=['POST'])
+@admin_required
+def delete_user(user_id):
+    user = User.query.get_or_404(user_id)
+
+    if user.id == current_user.id:
+        flash('Нельзя удалить самого себя.', 'error')
+        return redirect(url_for('admin_users'))
+
+    if user.username == 'admin':
+        flash('Нельзя удалить главного администратора.', 'error')
+        return redirect(url_for('admin_users'))
+
+    username = user.username
+    db.session.delete(user)
+    db.session.commit()
+    flash(f'Пользователь «{username}» удалён.', 'success')
+    return redirect(url_for('admin_users'))
+
+# ---------- Список выдач ----------
+@app.route('/loans')
+@login_required
+def loans_list():
+    if current_user.role != 'admin':
+        flash('Доступ только для администратора.', 'error')
+        return redirect(url_for('index'))
+
+    status_filter = request.args.get('status', '')
+    query = Loan.query.order_by(Loan.issue_date.desc())
+    if status_filter:
+        query = query.filter(Loan.status_id == int(status_filter))
+    loans = query.all()
+    statuses = CopyStatus.query.all()
+    return render_template('loans.html', loans=loans, statuses=statuses, selected_status=status_filter)
+
+# ---------- Оформление выдачи ----------
+@app.route('/loans/new', methods=['GET', 'POST'])
+@admin_required
+def new_loan():
+    copies = BookCopy.query.filter_by(status_id=1).all()
+    readers = Reader.query.order_by(Reader.last_name).all()
+
+    if request.method == 'POST':
+        copy_id = request.form.get('copy_id')
+        reader_id = request.form.get('reader_id')
+        days = request.form.get('days', '14')
+
+        errors = []
+        if not copy_id:
+            errors.append('Выберите экземпляр.')
+        if not reader_id:
+            errors.append('Выберите читателя.')
+        try:
+            days = int(days)
+            if days < 1 or days > 90:
+                errors.append('Срок должен быть от 1 до 90 дней.')
+        except ValueError:
+            errors.append('Срок должен быть числом.')
+
+        if errors:
+            return render_template('new_loan.html', errors=errors,
+                                   copies=copies, readers=readers)
+
+        copy = BookCopy.query.get(int(copy_id))
+        if copy.status_id != 1:
+            return render_template('new_loan.html', copies=copies, readers=readers,
+                                   errors=['Этот экземпляр уже выдан.'])
+
+        issue = date.today()
+        due = issue + timedelta(days=days)
+
+        loan = Loan(
+            copy_id=copy.id,
+            reader_id=int(reader_id),
+            issue_date=issue,
+            due_date=due,
+            status_id=2
+        )
+        copy.status_id = 2
+        db.session.add(loan)
+        db.session.commit()
+        flash('Книга выдана читателю.', 'success')
+        return redirect(url_for('loans_list'))
+
+    return render_template('new_loan.html', copies=copies, readers=readers)
+
+# ---------- Возврат книги ----------
+@app.route('/loans/<int:loan_id>/return', methods=['POST'])
+@admin_required
+def return_loan(loan_id):
+    loan = Loan.query.get_or_404(loan_id)
+    if loan.return_date:
+        flash('Книга уже возвращена.', 'error')
+        return redirect(url_for('loans_list'))
+
+    loan.return_date = date.today()
+    loan.status_id = 1
+    loan.copy.status_id = 1
+    db.session.commit()
+    flash('Книга возвращена.', 'success')
+    return redirect(url_for('loans_list'))
+
+# ---------- Экспорт книг в CSV ----------
+@app.route('/admin/export/books.csv')
+@admin_required
+def export_books_csv():
+    output = StringIO()
+    output.write('\ufeff')
+    writer = csv.writer(output, delimiter=';')
+    writer.writerow(['ID', 'Название', 'Год', 'ISBN', 'Жанр', 'Место хранения', 'Авторы'])
+
+    for b in Book.query.order_by(Book.title).all():
+        authors = ', '.join(f'{a.last_name} {a.first_name}' for a in b.authors) if b.authors else ''
+        writer.writerow([
+            b.id,
+            b.title,
+            b.year or '',
+            b.isbn or '',
+            b.genre.name if b.genre else '',
+            b.location or '',
+            authors
+        ])
+
+    output.seek(0)
+    return Response(
+        output.read(),
+        mimetype='text/csv; charset=utf-8',
+        headers={'Content-Disposition': 'attachment; filename=books.csv'}
+    )
+
+# ---------- Инициализация базы ----------
+def init_db():
+    with app.app_context():
+        db.create_all()
+
+        if Genre.query.count() == 0:
+            db.session.add_all([
+                Genre(name='Роман'),
+                Genre(name='Детектив'),
+                Genre(name='Фантастика'),
+                Genre(name='Научная литература'),
+                Genre(name='Поэзия'),
+                Genre(name='Детская литература'),
+            ])
+        if PublicationType.query.count() == 0:
+            db.session.add_all([
+                PublicationType(name='Бумажная книга'),
+                PublicationType(name='Электронная книга'),
+                PublicationType(name='Аудиокнига'),
+            ])
+        if CopyStatus.query.count() == 0:
+            db.session.add_all([
+                CopyStatus(name='Свободен'),
+                CopyStatus(name='Выдан'),
+                CopyStatus(name='Утерян'),
+                CopyStatus(name='Списан'),
+            ])
+        if Publisher.query.count() == 0:
+            db.session.add_all([
+                Publisher(name='АСТ', city='Москва', founded_year=1990),
+                Publisher(name='Эксмо', city='Москва', founded_year=1991),
+                Publisher(name='Питер', city='Санкт-Петербург', founded_year=1991),
+            ])
+
+        if User.query.filter_by(username='admin').first() is None:
+            admin = User(username='admin', role='admin')
+            admin.set_password('admin123')
+            db.session.add(admin)
+
+        db.session.commit()
+        print("База данных готова. Админ: admin / admin123")
+
+
+if __name__ == '__main__':
+    init_db()
+    app.run(debug=True)
+
+from flask_sqlalchemy import SQLAlchemy
+from flask_login import UserMixin
+from werkzeug.security import generate_password_hash, check_password_hash
+
+db = SQLAlchemy()
+
+# Справочник: Жанр
+class Genre(db.Model):
+    __tablename__ = 'genres'
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(100), nullable=False, unique=True)
+    description = db.Column(db.String(255))
+
+# Справочник: Тип издания
+class PublicationType(db.Model):
+    __tablename__ = 'publication_types'
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(50), nullable=False, unique=True)
+
+# Справочник: Статус экземпляра
+class CopyStatus(db.Model):
+    __tablename__ = 'copy_statuses'
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(50), nullable=False, unique=True)
+
+# Справочник: Издательство
+class Publisher(db.Model):
+    __tablename__ = 'publishers'
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(150), nullable=False, unique=True)
+    city = db.Column(db.String(100))
+    founded_year = db.Column(db.Integer)
+
+# Справочник: Автор
+class Author(db.Model):
+    __tablename__ = 'authors'
+    id = db.Column(db.Integer, primary_key=True)
+    last_name = db.Column(db.String(100), nullable=False)
+    first_name = db.Column(db.String(100), nullable=False)
+    middle_name = db.Column(db.String(100))
+    birth_year = db.Column(db.Integer)
+    country = db.Column(db.String(100))
+
+# Промежуточная таблица Книга-Автор (M:N)
+book_author = db.Table('book_author',
+    db.Column('book_id', db.Integer, db.ForeignKey('books.id'), primary_key=True),
+    db.Column('author_id', db.Integer, db.ForeignKey('authors.id'), primary_key=True)
+)
+
+# Сущность: Книга
+class Book(db.Model):
+    __tablename__ = 'books'
+    id = db.Column(db.Integer, primary_key=True)
+    title = db.Column(db.String(255), nullable=False)
+    isbn = db.Column(db.String(20), unique=True)
+    year = db.Column(db.Integer)
+    annotation = db.Column(db.Text)
+    language = db.Column(db.String(50), default='Русский')
+    location = db.Column(db.String(200), default='Не указано')  # место хранения
+    publisher_id = db.Column(db.Integer, db.ForeignKey('publishers.id'), nullable=False)
+    genre_id = db.Column(db.Integer, db.ForeignKey('genres.id'), nullable=False)
+    type_id = db.Column(db.Integer, db.ForeignKey('publication_types.id'), nullable=False)
+
+    publisher = db.relationship('Publisher')
+    genre = db.relationship('Genre')
+    pub_type = db.relationship('PublicationType')
+    authors = db.relationship('Author', secondary=book_author, backref='books')
+
+# Сущность: Местоположение (оставим для будущего)
+class Location(db.Model):
+    __tablename__ = 'locations'
+    id = db.Column(db.Integer, primary_key=True)
+    room = db.Column(db.String(50), nullable=False)
+    shelf = db.Column(db.String(50))
+    section = db.Column(db.String(50))
+
+# Сущность: Экземпляр книги (оставим для будущего)
+class BookCopy(db.Model):
+    __tablename__ = 'book_copies'
+    id = db.Column(db.Integer, primary_key=True)
+    book_id = db.Column(db.Integer, db.ForeignKey('books.id'), nullable=False)
+    location_id = db.Column(db.Integer, db.ForeignKey('locations.id'))
+    status_id = db.Column(db.Integer, db.ForeignKey('copy_statuses.id'), nullable=False, default=1)
+    file_path = db.Column(db.String(500))
+
+    book = db.relationship('Book')
+    location = db.relationship('Location')
+    status = db.relationship('CopyStatus')
+
+# Сущность: Читатель (оставим для будущего)
+class Reader(db.Model):
+    __tablename__ = 'readers'
+    id = db.Column(db.Integer, primary_key=True)
+    last_name = db.Column(db.String(100), nullable=False)
+    first_name = db.Column(db.String(100), nullable=False)
+    phone = db.Column(db.String(20))
+    email = db.Column(db.String(100), unique=True)
+
+# Сущность: Выдача (оставим для будущего)
+class Loan(db.Model):
+    __tablename__ = 'loans'
+    id = db.Column(db.Integer, primary_key=True)
+    copy_id = db.Column(db.Integer, db.ForeignKey('book_copies.id'), nullable=False)
+    reader_id = db.Column(db.Integer, db.ForeignKey('readers.id'), nullable=False)
+    issue_date = db.Column(db.Date, nullable=False)
+    due_date = db.Column(db.Date, nullable=False)
+    return_date = db.Column(db.Date)
+    status_id = db.Column(db.Integer, db.ForeignKey('copy_statuses.id'), nullable=False, default=2)
+
+    copy = db.relationship('BookCopy')
+    reader = db.relationship('Reader')
+    status = db.relationship('CopyStatus')
+
+# НОВОЕ: Пользователь (для входа на сайт)
+class User(UserMixin, db.Model):
+    __tablename__ = 'users'
+    id = db.Column(db.Integer, primary_key=True)
+    username = db.Column(db.String(50), unique=True, nullable=False)
+    password_hash = db.Column(db.String(255), nullable=False)
+    role = db.Column(db.String(20), nullable=False, default='reader')  # 'reader' или 'admin'
+
+    def set_password(self, password):
+        self.password_hash = generate_password_hash(password)
+
+    def check_password(self, password):
+        return check_password_hash(self.password_hash, password)
+
+"""
+Скрипт наполнения базы тестовыми данными.
+Запускать из терминала: python seed_data.py
+ВАЖНО: запускать при остановленном сервере (Ctrl+C), иначе база может быть занята.
+"""
+from app import app, db
+from models import (
+    Genre, PublicationType, CopyStatus, Publisher, Author,
+    Book, BookCopy, Location, Reader, Loan, User
+)
+from datetime import date, timedelta
+
+def seed():
+    with app.app_context():
+        print("Очищаем старые данные...")
+        Loan.query.delete()
+        BookCopy.query.delete()
+        Reader.query.delete()
+        Location.query.delete()
+        Book.query.delete()
+        Author.query.delete()
+        Publisher.query.delete()
+        Genre.query.delete()
+        PublicationType.query.delete()
+        CopyStatus.query.delete()
+        # Пользователей не удаляем — там admin
+
+        # ---------- Справочники (по 5+) ----------
+        genres = [
+            Genre(name='Роман', description='Крупное прозаическое произведение'),
+            Genre(name='Детектив', description='Раскрытие преступления'),
+            Genre(name='Фантастика', description='Научная и ненаучная фантастика'),
+            Genre(name='Научная литература', description='Научные труды и монографии'),
+            Genre(name='Поэзия', description='Стихотворные произведения'),
+            Genre(name='Детская литература', description='Книги для детей'),
+            Genre(name='Приключения', description='Приключенческие сюжеты'),
+        ]
+        db.session.add_all(genres)
+
+        pub_types = [
+            PublicationType(name='Бумажная книга'),
+            PublicationType(name='Электронная книга'),
+            PublicationType(name='Аудиокнига'),
+            PublicationType(name='Журнал'),
+            PublicationType(name='Газета'),
+        ]
+        db.session.add_all(pub_types)
+
+        statuses = [
+            CopyStatus(name='Свободен'),
+            CopyStatus(name='Выдан'),
+            CopyStatus(name='Утерян'),
+            CopyStatus(name='Списан'),
+            CopyStatus(name='На реставрации'),
+        ]
+        db.session.add_all(statuses)
+
+        publishers = [
+            Publisher(name='АСТ', city='Москва', founded_year=1990),
+            Publisher(name='Эксмо', city='Москва', founded_year=1991),
+            Publisher(name='Питер', city='Санкт-Петербург', founded_year=1991),
+            Publisher(name='Азбука', city='Санкт-Петербург', founded_year=1995),
+            Publisher(name='Манн, Иванов и Фербер', city='Москва', founded_year=2005),
+            Publisher(name='Альпина Паблишер', city='Москва', founded_year=1998),
+        ]
+        db.session.add_all(publishers)
+
+        authors = [
+            Author(last_name='Толстой', first_name='Лев', middle_name='Николаевич', birth_year=1828, country='Россия'),
+            Author(last_name='Достоевский', first_name='Фёдор', middle_name='Михайлович', birth_year=1821, country='Россия'),
+            Author(last_name='Пушкин', first_name='Александр', middle_name='Сергеевич', birth_year=1799, country='Россия'),
+            Author(last_name='Булгаков', first_name='Михаил', middle_name='Афанасьевич', birth_year=1891, country='Россия'),
+            Author(last_name='Чехов', first_name='Антон', middle_name='Павлович', birth_year=1860, country='Россия'),
+            Author(last_name='Оруэлл', first_name='Джордж', birth_year=1903, country='Великобритания'),
+            Author(last_name='Роулинг', first_name='Джоан', birth_year=1965, country='Великобритания'),
+            Author(last_name='Толкин', first_name='Джон', middle_name='Рональд Руэл', birth_year=1892, country='Великобритания'),
+            Author(last_name='Кинг', first_name='Стивен', birth_year=1947, country='США'),
+            Author(last_name='Азимов', first_name='Айзек', birth_year=1920, country='США'),
+            Author(last_name='Ахматова', first_name='Анна', middle_name='Андреевна', birth_year=1889, country='Россия'),
+            Author(last_name='Носов', first_name='Николай', middle_name='Николаевич', birth_year=1908, country='Россия'),
+        ]
+        db.session.add_all(authors)
+        db.session.commit()
+
+        locations = [
+            Location(room='Гостиная', shelf='Шкаф 1', section='Полка 1'),
+            Location(room='Гостиная', shelf='Шкаф 1', section='Полка 2'),
+            Location(room='Спальня', shelf='Шкаф 2', section='Полка 1'),
+            Location(room='Спальня', shelf='Шкаф 2', section='Полка 2'),
+            Location(room='Кабинет', shelf='Стеллаж 1', section='Полка 3'),
+            Location(room='Кабинет', shelf='Стеллаж 2', section='Полка 1'),
+        ]
+        db.session.add_all(locations)
+        db.session.commit()
+
+        # ---------- 16 книг ----------
+        books_data = [
+            ('Война и мир', 1869, '978-5-17-000001-1', 1, 1, 'Гостиная, шкаф 1, полка 1', ['Толстой']),
+            ('Анна Каренина', 1877, '978-5-17-000002-2', 1, 1, 'Гостиная, шкаф 1, полка 2', ['Толстой']),
+            ('Преступление и наказание', 1866, '978-5-17-000003-3', 1, 1, 'Гостиная, шкаф 1, полка 1', ['Достоевский']),
+            ('Братья Карамазовы', 1880, '978-5-17-000004-4', 1, 1, 'Спальня, шкаф 2, полка 1', ['Достоевский']),
+            ('Евгений Онегин', 1833, '978-5-17-000005-5', 5, 1, 'Спальня, шкаф 2, полка 2', ['Пушкин']),
+            ('Мастер и Маргарита', 1967, '978-5-17-000006-6', 1, 1, 'Кабинет, стеллаж 1, полка 3', ['Булгаков']),
+            ('Собачье сердце', 1925, '978-5-17-000007-7', 3, 1, 'Кабинет, стеллаж 1, полка 3', ['Булгаков']),
+            ('Вишнёвый сад', 1904, '978-5-17-000008-8', 1, 1, 'Гостиная, шкаф 1, полка 2', ['Чехов']),
+            ('1984', 1949, '978-5-17-000009-9', 3, 1, 'Кабинет, стеллаж 2, полка 1', ['Оруэлл']),
+            ('Гарри Поттер и философский камень', 1997, '978-5-17-000010-0', 6, 1, 'Спальня, шкаф 2, полка 2', ['Роулинг']),
+            ('Гарри Поттер и Тайная комната', 1998, '978-5-17-000011-1', 6, 1, 'Спальня, шкаф 2, полка 2', ['Роулинг']),
+            ('Властелин колец', 1954, '978-5-17-000012-2', 3, 1, 'Кабинет, стеллаж 1, полка 3', ['Толкин']),
+            ('Хоббит, или Туда и обратно', 1937, '978-5-17-000013-3', 3, 1, 'Кабинет, стеллаж 1, полка 3', ['Толкин']),
+            ('Сияние', 1977, '978-5-17-000014-4', 2, 1, 'Гостиная, шкаф 1, полка 1', ['Кинг']),
+            ('Оно', 1986, '978-5-17-000015-5', 2, 1, 'Гостиная, шкаф 1, полка 1', ['Кинг']),
+            ('Основание', 1951, '978-5-17-000016-6', 3, 2, 'Кабинет, стеллаж 2, полка 1', ['Азимов']),
+            ('Я, робот', 1950, '978-5-17-000017-7', 3, 2, 'Кабинет, стеллаж 2, полка 1', ['Азимов']),
+            ('Реквием', 1935, '978-5-17-000018-8', 5, 1, 'Спальня, шкаф 2, полка 1', ['Ахматова']),
+            ('Приключения Незнайки', 1954, '978-5-17-000019-9', 6, 1, 'Спальня, шкаф 2, полка 2', ['Носов']),
+            ('Тихий Дон', 1940, '978-5-17-000020-0', 1, 1, 'Гостиная, шкаф 1, полка 1', ['Толстой']),
+        ]
+
+        books = []
+        for (title, year, isbn, genre_id, type_id, location, author_last_names) in books_data:
+            book = Book(
+                title=title,
+                year=year,
+                isbn=isbn,
+                location=location,
+                genre_id=genre_id,
+                type_id=type_id,
+                publisher_id=1
+            )
+            # привязка авторов
+            for last in author_last_names:
+                a = Author.query.filter_by(last_name=last).first()
+                if a:
+                    book.authors.append(a)
+            books.append(book)
+        db.session.add_all(books)
+        db.session.commit()
+
+        # ---------- 15 читателей ----------
+        readers_data = [
+            ('Иванов', 'Иван', '+7-900-111-22-33', 'ivanov@mail.ru'),
+            ('Петрова', 'Мария', '+7-900-222-33-44', 'petrova@mail.ru'),
+            ('Сидоров', 'Алексей', '+7-900-333-44-55', 'sidorov@mail.ru'),
+            ('Кузнецова', 'Ольга', '+7-900-444-55-66', 'kuznetsova@mail.ru'),
+            ('Смирнов', 'Дмитрий', '+7-900-555-66-77', 'smirnov@mail.ru'),
+            ('Попова', 'Екатерина', '+7-900-666-77-88', 'popova@mail.ru'),
+            ('Волков', 'Сергей', '+7-900-777-88-99', 'volkov@mail.ru'),
+            ('Соколова', 'Анна', '+7-900-888-99-00', 'sokolova@mail.ru'),
+            ('Морозов', 'Николай', '+7-900-999-00-11', 'morozov@mail.ru'),
+            ('Лебедева', 'Татьяна', '+7-901-111-22-33', 'lebedeva@mail.ru'),
+            ('Новиков', 'Павел', '+7-901-222-33-44', 'novikov@mail.ru'),
+            ('Егорова', 'Наталья', '+7-901-333-44-55', 'egorova@mail.ru'),
+            ('Захаров', 'Артём', '+7-901-444-55-66', 'zaharov@mail.ru'),
+            ('Павлова', 'Ирина', '+7-901-555-66-77', 'pavlova@mail.ru'),
+            ('Романов', 'Максим', '+7-901-666-77-88', 'romanov@mail.ru'),
+        ]
+        readers = []
+        for (last, first, phone, email) in readers_data:
+            readers.append(Reader(last_name=last, first_name=first, phone=phone, email=email))
+        db.session.add_all(readers)
+        db.session.commit()
+
+        # ---------- 15 экземпляров книг ----------
+        copies = []
+        for i in range(15):
+            copy = BookCopy(
+                book_id=books[i % len(books)].id,
+                location_id=locations[i % len(locations)].id,
+                status_id=1
+            )
+            copies.append(copy)
+        db.session.add_all(copies)
+        db.session.commit()
+
+        # ---------- 15 выдач ----------
+        today = date.today()
+        for i in range(15):
+            issue = today - timedelta(days=30 - i)
+            due = issue + timedelta(days=14)
+            loan = Loan(
+                copy_id=copies[i].id,
+                reader_id=readers[i].id,
+                issue_date=issue,
+                due_date=due,
+                status_id=1 if i % 3 == 0 else 2
+            )
+            if i % 3 != 0:
+                loan.return_date = issue + timedelta(days=7)
+            db.session.add(loan)
+        db.session.commit()
+
+        print("=" * 50)
+        print("База наполнена тестовыми данными!")
+        print(f"Жанров: {Genre.query.count()}")
+        print(f"Типов изданий: {PublicationType.query.count()}")
+        print(f"Статусов: {CopyStatus.query.count()}")
+        print(f"Издательств: {Publisher.query.count()}")
+        print(f"Авторов: {Author.query.count()}")
+        print(f"Книг: {Book.query.count()}")
+        print(f"Мест: {Location.query.count()}")
+        print(f"Читателей: {Reader.query.count()}")
+        print(f"Экземпляров: {BookCopy.query.count()}")
+        print(f"Выдач: {Loan.query.count()}")
+        print("=" * 50)
+
+
+if __name__ == '__main__':
+    seed()
